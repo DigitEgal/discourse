@@ -37,9 +37,9 @@ class ImportScripts::Drupal < ImportScripts::Base
     end
 
     import_forum_topics
-
     import_replies
     import_likes
+    import_private_messages
     mark_topics_as_solved
     import_sso_records
     import_attachments
@@ -280,15 +280,98 @@ class ImportScripts::Drupal < ImportScripts::Base
       end
     end
   end
+
+  def import_private_messages
+    puts '', "importing private messages"
+
+    puts '', "building target users lookup table"
+
+    target_user_ids = {}
+
+    batches(BATCH_SIZE) do |offset|
+      results = mysql_query(<<~SQL
+        SELECT DISTINCT thread_id, recipient
+                   FROM pm_index
+                  LIMIT #{BATCH_SIZE}
+                 OFFSET #{offset}
+      SQL
+      ).to_a
+
+      break if results.size < 1
+
+      results.each do |row|
+        (target_user_ids[row['thread_id']] ||= []) << row['recipient']
+      end
+    end
+
+    puts '', "importing private posts"
+
+    total_count = mysql_query(<<-SQL
+         SELECT COUNT(*) count
+           FROM pm_message
+      LEFT JOIN pm_index ON pm_index.mid = pm_message.mid
+          WHERE pm_message.author = pm_index.recipient
+    SQL
+    ).first['count']
+
+    batches(BATCH_SIZE) do |offset|
+      results = mysql_query(<<-SQL
+           SELECT pm_message.mid mid,
+                  pm_index.thread_id thread_id,
+                  pm_message.author author,
+                  pm_message.subject `subject`,
+                  pm_message.body body,
+                  pm_message.`timestamp` `timestamp`,
+                  pm_message.reply_to_mid reply_to_mid
+             FROM pm_message
+        LEFT JOIN pm_index ON pm_index.mid = pm_message.mid
+            WHERE pm_message.author = pm_index.recipient
+            LIMIT #{BATCH_SIZE}
+           OFFSET #{offset}
+      SQL
+      ).to_a
+
+      break if results.size < 1
+
+      next if all_records_exist? :posts, results.map { |p| "mid:#{p['mid']}" }
+
+      create_posts(results, total: total_count, offset: offset) do |row|
+        begin
+          mapped = {
+            id: "mid:#{row['mid']}",
+            user_id: @lookup.user_id_from_imported_user_id(row['author']) || Discourse.system_user.id,
+            created_at: Time.zone.at(row['timestamp']),
+            raw: preprocess_raw(row['body'])
           }
-          if row['pid']
-            parent = topic_lookup_from_imported_post_id("cid:#{row['pid']}")
-            h[:reply_to_post_number] = parent[:post_number] if parent && parent[:post_number] > (1)
+
+          if row['mid'] == row['thread_id']
+            target_recipients = target_user_ids[row['thread_id']] || []
+            target_recipients << row['author']
+            target_recipients.uniq!
+            target_recipients.map! { |user_id| @lookup.find_user_by_import_id(user_id).try(:username) }
+            target_recipients.compact!
+
+            mapped[:title] = row['subject'].try(:strip)
+            mapped[:archetype] = Archetype.private_message
+            mapped[:target_usernames] = target_recipients.join(',')
+          else
+            topic = topic_lookup_from_imported_post_id("mid:#{row['thread_id']}")
+            raise 'no topic found for this PM' if topic.blank?
+
+            mapped[:topic_id] = topic[:topic_id]
+
+            if row['reply_to_mid'] > 0
+              post_id = post_id_from_imported_post_id("mid:#{row['reply_to_mid']}")
+              if post = Post.find_by(id: post_id)
+                mapped[:reply_to_post_number] = post.post_number
+              end
+            end
           end
-          h
-        else
-          puts "No topic found for comment #{row['cid']}"
-          nil
+
+          mapped
+        rescue => e
+          STDERR.puts "Failed to import private message: #{e.message}"
+          STDERR.puts "  row = #{row.inspect}"
         end
       end
     end
