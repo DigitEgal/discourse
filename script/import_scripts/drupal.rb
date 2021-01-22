@@ -195,19 +195,24 @@ class ImportScripts::Drupal < ImportScripts::Base
       next if all_records_exist? :posts, results.map { |p| "nid:#{p['nid']}" }
 
       create_posts(results, total: total_count, offset: offset) do |row|
-        raw = preprocess_raw(row['body'])
-        topic = {
-          id: "nid:#{row['nid']}",
-          user_id: user_id_from_imported_user_id(row['uid']) || -1,
-          category: category_id_from_imported_category_id(row['tid']),
-          raw: raw,
-          created_at: Time.zone.at(row['created']),
-          pinned_at: row['sticky'].to_i == 1 ? Time.zone.at(row['created']) : nil,
-          title: row['title'].try(:strip),
-          views: row['views']
-        }
-        topic[:custom_fields] = { import_solved: true } if row['solved'].present?
-        topic
+        begin
+          raw = preprocess_raw(row['body'])
+          topic = {
+            id: "nid:#{row['nid']}",
+            user_id: user_id_from_imported_user_id(row['uid']) || -1,
+            category: category_id_from_imported_category_id(row['tid']),
+            raw: raw,
+            created_at: Time.zone.at(row['created']),
+            pinned_at: row['sticky'].to_i == 1 ? Time.zone.at(row['created']) : nil,
+            title: row['title'].try(:strip),
+            views: row['views']
+          }
+          topic[:custom_fields] = { import_solved: true } if row['solved'].present?
+          topic
+        rescue => e
+          STDERR.puts "Failed to import topic: #{e.message}"
+          STDERR.puts "  row = #{row.inspect}"
+        end
       end
     end
   end
@@ -248,15 +253,33 @@ class ImportScripts::Drupal < ImportScripts::Base
       next if all_records_exist? :posts, results.map { |p| "cid:#{p['cid']}" }
 
       create_posts(results, total: total_count, offset: offset) do |row|
-        topic_mapping = topic_lookup_from_imported_post_id("nid:#{row['nid']}")
-        if topic_mapping && topic_id = topic_mapping[:topic_id]
-          raw = preprocess_raw(row['body'])
-          h = {
-            id: "cid:#{row['cid']}",
-            topic_id: topic_id,
-            user_id: user_id_from_imported_user_id(row['uid']) || -1,
-            raw: raw,
-            created_at: Time.zone.at(row['created']),
+        begin
+          topic_mapping = topic_lookup_from_imported_post_id("nid:#{row['nid']}")
+          if topic_mapping && topic_id = topic_mapping[:topic_id]
+            raw = preprocess_raw(row['body'])
+            h = {
+              id: "cid:#{row['cid']}",
+              topic_id: topic_id,
+              user_id: user_id_from_imported_user_id(row['uid']) || -1,
+              raw: raw,
+              created_at: Time.zone.at(row['created']),
+            }
+            if row['pid']
+              parent = topic_lookup_from_imported_post_id("cid:#{row['pid']}")
+              h[:reply_to_post_number] = parent[:post_number] if parent && parent[:post_number] > (1)
+            end
+            h
+          else
+            puts "No topic found for comment #{row['cid']}"
+            nil
+          end
+        rescue => e
+          STDERR.puts "Failed to import reply: #{e.message}"
+          STDERR.puts "  row = #{row.inspect}"
+        end
+      end
+    end
+  end
           }
           if row['pid']
             parent = topic_lookup_from_imported_post_id("cid:#{row['pid']}")
