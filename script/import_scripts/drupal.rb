@@ -287,6 +287,7 @@ class ImportScripts::Drupal < ImportScripts::Base
     puts '', "building target users lookup table"
 
     target_user_ids = {}
+    thread_id_to_topic_id = {}
 
     batches(BATCH_SIZE) do |offset|
       results = mysql_query(<<~SQL
@@ -344,7 +345,7 @@ class ImportScripts::Drupal < ImportScripts::Base
             raw: preprocess_raw(row['body'])
           }
 
-          if row['mid'] == row['thread_id']
+          if thread_id_to_topic_id[row['thread_id']].blank?
             target_recipients = target_user_ids[row['thread_id']] || []
             target_recipients << row['author']
             target_recipients.uniq!
@@ -354,11 +355,13 @@ class ImportScripts::Drupal < ImportScripts::Base
             mapped[:title] = row['subject'].try(:strip)
             mapped[:archetype] = Archetype.private_message
             mapped[:target_usernames] = target_recipients.join(',')
-          else
-            topic = topic_lookup_from_imported_post_id("mid:#{row['thread_id']}")
-            raise 'no topic found for this PM' if topic.blank?
 
-            mapped[:topic_id] = topic[:topic_id]
+            mapped[:post_create_action] = proc do |post|
+              thread_id_to_topic_id[row['thread_id']] = post.topic_id
+            end
+          else
+            mapped[:topic_id] = thread_id_to_topic_id[row['thread_id']]
+            raise 'no topic found for this PM' if mapped[:topic_id].blank?
 
             if row['reply_to_mid'] > 0
               post_id = post_id_from_imported_post_id("mid:#{row['reply_to_mid']}")
