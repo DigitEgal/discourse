@@ -7,7 +7,6 @@ require File.expand_path(File.dirname(__FILE__) + "/base.rb")
 class ImportScripts::Drupal < ImportScripts::Base
 
   DRUPAL_DB = ENV['DRUPAL_DB'] || "drupal"
-  VID = ENV['DRUPAL_VID'] || 1
   BATCH_SIZE = 1000
   ATTACHMENT_DIR = "/root/files/upload"
 
@@ -32,19 +31,20 @@ class ImportScripts::Drupal < ImportScripts::Base
     # "Nodes" in Drupal are divided into types. Here we import two types,
     # and will later import all the comments/replies for each node.
     # You will need to figure out what the type names are on your install and edit the queries to match.
-    if ENV['DRUPAL_IMPORT_BLOG']
-      import_blog_topics
-    end
+    import_blog_topics if ENV['DRUPAL_IMPORT_BLOG']
 
     import_forum_topics
     import_replies
-    import_likes
     import_private_messages
+    import_likes
+    import_bookmarks
+    import_watching
     mark_topics_as_solved
     import_sso_records
     import_attachments
     postprocess_posts
     create_permalinks
+    import_blocked_users
     import_gravatars
   end
 
@@ -104,7 +104,7 @@ class ImportScripts::Drupal < ImportScripts::Base
                name,
                description
           FROM taxonomy_term_data
-         WHERE vid = #{VID}
+         WHERE vid = #{ENV['CATEGORY_ID'] || 1}
     SQL
     ).to_a
 
@@ -387,25 +387,87 @@ class ImportScripts::Drupal < ImportScripts::Base
       likes = mysql_query(<<-SQL
         SELECT flagging_id,
                fid,
-	       entity_id,
-	       uid
-	  FROM flagging
-	 WHERE fid = 5
-	    OR fid = 6
-	 LIMIT #{BATCH_SIZE}
-	OFFSET #{offset}
+               entity_id,
+               uid
+          FROM flagging
+         WHERE fid = #{ENV['LIKE_NODE_ID'] || 5}
+            OR fid = #{ENV['LIKE_COMMENT_ID'] || 6}
+         LIMIT #{BATCH_SIZE}
+        OFFSET #{offset}
       SQL
       ).to_a
 
       break if likes.empty?
 
       likes.each do |l|
-        identifier = l['fid'] == 5 ? 'nid' : 'cid'
+        identifier = l['fid'] == (ENV['LIKE_NODE_ID'] || 5) ? 'nid' : 'cid'
         next unless user_id = user_id_from_imported_user_id(l['uid'])
         next unless post_id = post_id_from_imported_post_id("#{identifier}:#{l['entity_id']}")
         next unless user = User.find_by(id: user_id)
         next unless post = Post.find_by(id: post_id)
         PostActionCreator.like(user, post) rescue nil
+      end
+    end
+  end
+
+  def import_bookmarks
+    puts "", "importing bookmarks"
+
+    batches(BATCH_SIZE) do |offset|
+      bookmarks = mysql_query(<<-SQL
+        SELECT flagging_id,
+               fid,
+               entity_id,
+               uid
+          FROM flagging
+         WHERE fid = #{ENV['BOOKMARK_ID'] || 5}
+         LIMIT #{BATCH_SIZE}
+        OFFSET #{offset}
+      SQL
+      ).to_a
+
+      break if bookmarks.empty?
+
+      bookmarks.each do |l|
+        next unless user_id = user_id_from_imported_user_id(l['uid'])
+        next unless post_id = post_id_from_imported_post_id("nid:#{l['entity_id']}")
+        next unless user = User.find_by(id: user_id)
+        next unless post = Post.find_by(id: post_id)
+        PostActionCreator.bookmark(user, post) rescue nil
+      end
+    end
+  end
+
+  def import_watching
+    puts "", "Importing topic subscriptions..."
+
+    batches do |offset|
+      rows = mysql_query(<<-SQL
+        SELECT flagging_id,
+               fid,
+               entity_id,
+               uid
+          FROM flagging
+         WHERE fid = #{ENV['SUBSCRIBE_ID'] || 5}
+         LIMIT #{BATCH_SIZE}
+        OFFSET #{offset}
+      SQL
+      ).to_a
+
+      break if rows.size < 1
+
+      rows.each do |row|
+        user_id = @lookup.user_id_from_imported_user_id(row[:user_id])
+        topic = @lookup.topic_lookup_from_imported_post_id(row[:topic_first_post_id])
+
+        next unless user_id = user_id_from_imported_user_id(row['uid'])
+        next unless post_id = post_id_from_imported_post_id("nid:#{row['entity_id']}")
+        next unless user = User.find_by(id: user_id)
+        next unless post = Post.find_by(id: post_id)
+
+        if user && post
+          TopicUser.change(user.id, post.topic_id, notification_level: NotificationLevels.all[:watching])
+        end
       end
     end
   end
@@ -611,6 +673,28 @@ class ImportScripts::Drupal < ImportScripts::Base
         puts '', "Failed rewrite on post: #{post.id}"
       ensure
         print_status(current += 1, max)
+      end
+    end
+  end
+
+  def import_blocked_users
+    puts "", "importing blocked users"
+
+    batches(BATCH_SIZE) do |offset|
+      rows = mysql_query(<<-SQL
+        SELECT author, recipient
+          FROM pm_block_user
+         LIMIT #{BATCH_SIZE}
+        OFFSET #{offset}
+      SQL
+      ).to_a
+
+      break if rows.empty?
+
+      rows.each do |row|
+        next unless user_id = user_id_from_imported_user_id(row['author'])
+        next unless muted_user_id = user_id_from_imported_user_id(row['recipient'])
+        MutedUser.create(user_id: user_id, muted_user_id: muted_user_id) rescue nil
       end
     end
   end
