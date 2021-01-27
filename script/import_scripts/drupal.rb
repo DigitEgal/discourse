@@ -60,7 +60,8 @@ class ImportScripts::Drupal < ImportScripts::Base
           SELECT uid,
                  name username,
                  mail email,
-                 created
+                 created,
+                 status
             FROM users
            WHERE uid > #{last_user_id}
         ORDER BY uid
@@ -84,7 +85,9 @@ class ImportScripts::Drupal < ImportScripts::Base
           id: user["uid"],
           name: username,
           email: email,
-          created_at: Time.zone.at(user["created"])
+          created_at: Time.zone.at(user["created"]),
+          suspended_at: user["status"].to_i == 0 ? Time.zone.now : nil,
+          suspended_till: user["status"].to_i == 0 ? 100.years.from_now : nil
         }
       end
     end
