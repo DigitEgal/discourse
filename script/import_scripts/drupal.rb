@@ -178,8 +178,10 @@ class ImportScripts::Drupal < ImportScripts::Base
                fi.created created,
                fi.sticky sticky,
                f.body_value body,
-	       nc.totalcount views,
-	       fl.timestamp solved
+         nc.totalcount views,
+         n.status status,
+         n.comment comment,
+         fl.timestamp solved
           FROM forum_index fi
 	 LEFT JOIN node n ON fi.nid = n.nid
 	 LEFT JOIN field_data_body f ON f.entity_id = n.nid
@@ -187,7 +189,6 @@ class ImportScripts::Drupal < ImportScripts::Base
 	     AND fl.fid = 7
 	 LEFT JOIN node_counter nc ON nc.nid = n.nid
          WHERE n.type = 'forum'
-           AND n.status = 1
          LIMIT #{BATCH_SIZE}
         OFFSET #{offset};
       SQL
@@ -208,7 +209,9 @@ class ImportScripts::Drupal < ImportScripts::Base
             created_at: Time.zone.at(row['created']),
             pinned_at: row['sticky'].to_i == 1 ? Time.zone.at(row['created']) : nil,
             title: row['title'].try(:strip),
-            views: row['views']
+            views: row['views'],
+            visible: row['status'].to_i == 1,
+            closed: row['comment'].to_i != 2
           }
           topic[:custom_fields] = { import_solved: true } if row['solved'].present?
           topic
