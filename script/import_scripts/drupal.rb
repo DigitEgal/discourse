@@ -1,14 +1,22 @@
 # frozen_string_literal: true
 
-require "mysql2"
-require "htmlentities"
-require File.expand_path(File.dirname(__FILE__) + "/base.rb")
+require 'mysql2'
+require 'htmlentities'
+require File.expand_path(File.dirname(__FILE__) + '/base.rb')
 
 class ImportScripts::Drupal < ImportScripts::Base
-
-  DRUPAL_DB = ENV['DRUPAL_DB'] || "drupal"
+  DRUPAL_DB = ENV['DRUPAL_DB'] || 'drupal'
   BATCH_SIZE = 1000
-  ATTACHMENT_DIR = "/root/files/upload"
+
+  ATTACHMENT_DIR = '/root/files/upload'
+
+  CATEGORY_ID = ENV['CATEGORY_ID'] || 1
+
+  # Flag IDs
+  BOOKMARK_ID = ENV['BOOKMARK_ID'] || 1
+  SUBSCRIBE_ID = ENV['SUBSCRIBE_ID'] || 2
+  LIKE_COMMENT_ID = ENV['LIKE_COMMENT_ID'] || 4
+  LIKE_NODE_ID = ENV['LIKE_NODE_ID'] || 5
 
   def initialize
     super
@@ -16,16 +24,19 @@ class ImportScripts::Drupal < ImportScripts::Base
     @htmlentities = HTMLEntities.new
 
     @client = Mysql2::Client.new(
-      host: "localhost",
-      username: "root",
-      #password: "password",
+      host: 'localhost',
+      username: 'root',
+      # password: 'password',
       database: DRUPAL_DB
     )
   end
 
   def execute
-
     import_users
+    import_muted_users
+    import_sso_records
+    import_gravatars
+
     import_categories
 
     # "Nodes" in Drupal are divided into types. Here we import two types,
@@ -36,58 +47,58 @@ class ImportScripts::Drupal < ImportScripts::Base
     import_forum_topics
     import_replies
     import_private_messages
+
+    import_attachments
+    mark_topics_as_solved
+    postprocess_posts
+
+    import_subscriptions
     import_likes
     import_bookmarks
-    import_watching
-    mark_topics_as_solved
-    import_sso_records
-    import_attachments
-    postprocess_posts
+
     create_permalinks
-    import_blocked_users
-    import_gravatars
   end
 
   def import_users
-    puts "", "importing users"
+    puts '', 'importing users'
 
-    user_count = mysql_query("SELECT count(uid) count FROM users").first["count"]
+    total_count = mysql_query(<<~SQL).first['count']
+      SELECT COUNT(uid) count
+      FROM users
+    SQL
 
     last_user_id = -1
 
     batches(BATCH_SIZE) do |offset|
-      users = mysql_query(<<-SQL
-          SELECT uid,
-                 name username,
-                 mail email,
-                 created,
-                 status
-            FROM users
-           WHERE uid > #{last_user_id}
+      users = mysql_query(<<-SQL).to_a
+        SELECT uid,
+               name username,
+               mail email,
+               created,
+               status
+        FROM users
+        WHERE uid > #{last_user_id}
         ORDER BY uid
-           LIMIT #{BATCH_SIZE}
+        LIMIT #{BATCH_SIZE}
       SQL
-      ).to_a
 
       break if users.empty?
+      last_user_id = users[-1]['uid']
+      users.reject! { |u| @lookup.user_already_imported?(u['uid']) }
 
-      last_user_id = users[-1]["uid"]
+      create_users(users, total: total_count, offset: offset) do |user|
+        username = @htmlentities.decode(user['username']).strip
 
-      users.reject! { |u| @lookup.user_already_imported?(u["uid"]) }
-
-      create_users(users, total: user_count, offset: offset) do |user|
-        email = user["email"].presence || fake_email
+        email = user['email'].presence || fake_email
         email = fake_email unless email[EmailValidator.email_regex]
 
-        username = @htmlentities.decode(user["username"]).strip
-
         {
-          id: user["uid"],
+          id: user['uid'],
           name: username,
           email: email,
-          created_at: Time.zone.at(user["created"]),
-          suspended_at: user["status"].to_i == 0 ? Time.zone.now : nil,
-          suspended_till: user["status"].to_i == 0 ? 100.years.from_now : nil
+          created_at: Time.zone.at(user['created']),
+          suspended_at: user['status'].to_i == 0 ? Time.zone.now : nil,
+          suspended_till: user['status'].to_i == 0 ? 100.years.from_now : nil
         }
       end
     end
@@ -100,16 +111,15 @@ class ImportScripts::Drupal < ImportScripts::Base
     #   * Table name may be term_data.
     #   * May need to select a vid other than 1
 
-    puts "", "importing categories"
+    puts '', 'importing categories'
 
-    categories = mysql_query(<<-SQL
-        SELECT tid,
-               name,
-               description
-          FROM taxonomy_term_data
-         WHERE vid = #{ENV['CATEGORY_ID'] || 1}
+    categories = mysql_query(<<-SQL).to_a
+      SELECT tid,
+             name,
+             description
+      FROM taxonomy_term_data
+      WHERE vid = #{CATEGORY_ID}
     SQL
-    ).to_a
 
     create_categories(categories) do |category|
       {
@@ -121,27 +131,33 @@ class ImportScripts::Drupal < ImportScripts::Base
   end
 
   def import_blog_topics
-    puts '', "importing blog topics"
+    puts '', 'importing blog topics'
 
-    create_category(
-      {
-        name: 'Blog',
-        description: "Articles from the blog"
-      },
-    nil) unless Category.find_by_name('Blog')
-
-    blogs = mysql_query(<<-SQL
-      SELECT n.nid nid, n.title title, n.uid uid, n.created created, n.sticky sticky,
-             f.body_value body
-        FROM node n,
-             field_data_body f
-       WHERE n.type = 'article'
-         AND n.nid = f.entity_id
-         AND n.status = 1
-    SQL
-    ).to_a
+    unless Category.find_by_name('Blog')
+      create_category(
+        {
+          name: 'Blog',
+          description: 'Articles from the blog'
+        },
+        nil
+      )
+    end
 
     category_id = Category.find_by_name('Blog').id
+
+    blogs = mysql_query(<<-SQL).to_a
+      SELECT n.nid nid,
+             n.title title,
+             n.uid uid,
+             n.created created,
+             n.sticky sticky,
+             f.body_value body
+      FROM node n,
+           field_data_body f
+      WHERE n.type = 'article'
+        AND n.nid = f.entity_id
+        AND n.status = 1
+    SQL
 
     create_posts(blogs) do |topic|
       {
@@ -158,19 +174,19 @@ class ImportScripts::Drupal < ImportScripts::Base
   end
 
   def import_forum_topics
-    puts '', "importing forum topics"
+    puts '', 'importing forum topics'
 
-    total_count = mysql_query(<<-SQL
-        SELECT COUNT(*) count
-          FROM forum_index fi, node n
-         WHERE n.type = 'forum'
-           AND fi.nid = n.nid
-           AND n.status = 1
+    total_count = mysql_query(<<-SQL).first['count']
+      SELECT COUNT(*) count
+      FROM forum_index fi,
+           node n
+      WHERE n.type = 'forum'
+        AND fi.nid = n.nid
+        AND n.status = 1
     SQL
-    ).first['count']
 
     batches(BATCH_SIZE) do |offset|
-      results = mysql_query(<<-SQL
+      results = mysql_query(<<-SQL).to_a
         SELECT fi.nid nid,
                fi.title title,
                fi.tid tid,
@@ -178,34 +194,30 @@ class ImportScripts::Drupal < ImportScripts::Base
                fi.created created,
                fi.sticky sticky,
                f.body_value body,
-         nc.totalcount views,
-         n.status status,
-         n.comment comment,
-         fl.timestamp solved
-          FROM forum_index fi
-	 LEFT JOIN node n ON fi.nid = n.nid
-	 LEFT JOIN field_data_body f ON f.entity_id = n.nid
-	 LEFT JOIN flagging fl ON fl.entity_id = n.nid
-	     AND fl.fid = 7
-	 LEFT JOIN node_counter nc ON nc.nid = n.nid
-         WHERE n.type = 'forum'
-         LIMIT #{BATCH_SIZE}
+               nc.totalcount views,
+               n.status status,
+               n.comment comment,
+               fl.timestamp solved
+        FROM forum_index fi
+        LEFT JOIN node n ON fi.nid = n.nid
+        LEFT JOIN field_data_body f ON f.entity_id = n.nid
+        LEFT JOIN flagging fl ON fl.entity_id = n.nid AND fl.fid = 7
+        LEFT JOIN node_counter nc ON nc.nid = n.nid
+        WHERE n.type = 'forum'
+        LIMIT #{BATCH_SIZE}
         OFFSET #{offset};
       SQL
-      ).to_a
 
       break if results.size < 1
-
       next if all_records_exist? :posts, results.map { |p| "nid:#{p['nid']}" }
 
       create_posts(results, total: total_count, offset: offset) do |row|
         begin
-          raw = preprocess_raw(row['body'])
           topic = {
             id: "nid:#{row['nid']}",
             user_id: user_id_from_imported_user_id(row['uid']) || -1,
             category: category_id_from_imported_category_id(row['tid']),
-            raw: raw,
+            raw: preprocess_raw(row['body']),
             created_at: Time.zone.at(row['created']),
             pinned_at: row['sticky'].to_i == 1 ? Time.zone.at(row['created']) : nil,
             title: row['title'].try(:strip),
@@ -216,93 +228,95 @@ class ImportScripts::Drupal < ImportScripts::Base
           topic[:custom_fields] = { import_solved: true } if row['solved'].present?
           topic
         rescue => e
-          STDERR.puts "Failed to import topic: #{e.message}"
-          STDERR.puts "  row = #{row.inspect}"
+          warn "Failed to import topic: #{e.message}"
+          warn "  row = #{row.inspect}"
         end
       end
     end
   end
 
   def import_replies
-    puts '', "creating replies in topics"
+    puts '', 'creating replies in topics'
 
-    total_count = mysql_query(<<-SQL
-        SELECT COUNT(*) count
-          FROM comment c,
-               node n
-         WHERE n.nid = c.nid
-           AND c.status = 1
-           AND n.type IN ('article', 'forum')
-           AND n.status = 1
+    total_count = mysql_query(<<-SQL).first['count']
+      SELECT COUNT(*) count
+      FROM comment c,
+           node n
+      WHERE n.nid = c.nid
+        AND c.status = 1
+        AND n.type IN ('article', 'forum')
+        AND n.status = 1
     SQL
-    ).first['count']
 
     batches(BATCH_SIZE) do |offset|
-      results = mysql_query(<<-SQL
-        SELECT c.cid, c.pid, c.nid, c.uid, c.created,
+      results = mysql_query(<<-SQL).to_a
+        SELECT c.cid,
+               c.pid,
+               c.nid,
+               c.uid,
+               c.created,
                f.comment_body_value body
-          FROM comment c,
-               field_data_comment_body f,
-               node n
-         WHERE c.cid = f.entity_id
-           AND n.nid = c.nid
-           AND c.status = 1
-           AND n.type IN ('blog', 'forum')
-           AND n.status = 1
-         LIMIT #{BATCH_SIZE}
+        FROM comment c,
+             field_data_comment_body f,
+             node n
+        WHERE c.cid = f.entity_id
+          AND n.nid = c.nid
+          AND c.status = 1
+          AND n.type IN ('blog', 'forum')
+          AND n.status = 1
+        LIMIT #{BATCH_SIZE}
         OFFSET #{offset}
       SQL
-      ).to_a
 
       break if results.size < 1
-
       next if all_records_exist? :posts, results.map { |p| "cid:#{p['cid']}" }
 
       create_posts(results, total: total_count, offset: offset) do |row|
         begin
           topic_mapping = topic_lookup_from_imported_post_id("nid:#{row['nid']}")
           if topic_mapping && topic_id = topic_mapping[:topic_id]
-            raw = preprocess_raw(row['body'])
-            h = {
+            mapped = {
               id: "cid:#{row['cid']}",
               topic_id: topic_id,
               user_id: user_id_from_imported_user_id(row['uid']) || -1,
-              raw: raw,
-              created_at: Time.zone.at(row['created']),
+              raw: preprocess_raw(row['body']),
+              created_at: Time.zone.at(row['created'])
             }
+
             if row['pid']
               parent = topic_lookup_from_imported_post_id("cid:#{row['pid']}")
-              h[:reply_to_post_number] = parent[:post_number] if parent && parent[:post_number] > (1)
+              mapped[:reply_to_post_number] = parent[:post_number] if parent && parent[:post_number] > (1)
             end
-            h
+
+            mapped
           else
             puts "No topic found for comment #{row['cid']}"
             nil
           end
         rescue => e
-          STDERR.puts "Failed to import reply: #{e.message}"
-          STDERR.puts "  row = #{row.inspect}"
+          warn "Failed to import reply: #{e.message}"
+          warn "  row = #{row.inspect}"
         end
       end
     end
   end
 
   def import_private_messages
-    puts '', "importing private messages"
+    puts '', 'importing private messages'
 
-    puts '', "building target users lookup table"
+    puts '  building target users lookup table'
 
     target_user_ids = {}
     thread_id_to_topic_id = {}
 
     batches(BATCH_SIZE) do |offset|
-      results = mysql_query(<<~SQL
-        SELECT DISTINCT thread_id, recipient
-                   FROM pm_index
-                  LIMIT #{BATCH_SIZE}
-                 OFFSET #{offset}
+      results = mysql_query(<<~SQL).to_a
+        SELECT DISTINCT thread_id,
+               recipient
+        FROM pm_index
+        LIMIT #{BATCH_SIZE}
+        OFFSET #{offset}
       SQL
-      ).to_a
 
       break if results.size < 1
 
@@ -311,35 +325,32 @@ class ImportScripts::Drupal < ImportScripts::Base
       end
     end
 
-    puts '', "importing private posts"
+    puts '  importing private posts'
 
-    total_count = mysql_query(<<-SQL
-         SELECT COUNT(*) count
-           FROM pm_message
+    total_count = mysql_query(<<-SQL).first['count']
+      SELECT COUNT(*) count
+      FROM pm_message
       LEFT JOIN pm_index ON pm_index.mid = pm_message.mid
-          WHERE pm_message.author = pm_index.recipient
+      WHERE pm_message.author = pm_index.recipient
     SQL
-    ).first['count']
 
     batches(BATCH_SIZE) do |offset|
-      results = mysql_query(<<-SQL
-           SELECT pm_message.mid mid,
-                  pm_index.thread_id thread_id,
-                  pm_message.author author,
-                  pm_message.subject `subject`,
-                  pm_message.body body,
-                  pm_message.`timestamp` `timestamp`,
-                  pm_message.reply_to_mid reply_to_mid
-             FROM pm_message
+      results = mysql_query(<<-SQL).to_a
+        SELECT pm_message.mid mid,
+               pm_index.thread_id thread_id,
+               pm_message.author author,
+               pm_message.subject `subject`,
+               pm_message.body body,
+               pm_message.`timestamp` `timestamp`,
+               pm_message.reply_to_mid reply_to_mid
+        FROM pm_message
         LEFT JOIN pm_index ON pm_index.mid = pm_message.mid
-            WHERE pm_message.author = pm_index.recipient
-            LIMIT #{BATCH_SIZE}
-           OFFSET #{offset}
+        WHERE pm_message.author = pm_index.recipient
+        LIMIT #{BATCH_SIZE}
+        OFFSET #{offset}
       SQL
-      ).to_a
 
       break if results.size < 1
-
       next if all_records_exist? :posts, results.map { |p| "mid:#{p['mid']}" }
 
       create_posts(results, total: total_count, offset: offset) do |row|
@@ -379,90 +390,126 @@ class ImportScripts::Drupal < ImportScripts::Base
 
           mapped
         rescue => e
-          STDERR.puts "Failed to import private message: #{e.message}"
-          STDERR.puts "  row = #{row.inspect}"
+          warn "Failed to import private message: #{e.message}"
+          warn "  row = #{row.inspect}"
         end
       end
     end
   end
 
   def import_likes
-    puts "", "importing post likes"
+    puts '', 'importing post likes'
+
+    total_count = mysql_query(<<~SQL).first['count']
+      SELECT COUNT(uid) count
+      FROM flagging
+      WHERE fid = #{LIKE_NODE_ID}
+         OR fid = #{LIKE_COMMENT_ID}
+    SQL
+    count = 0
 
     batches(BATCH_SIZE) do |offset|
-      likes = mysql_query(<<-SQL
+      rows = mysql_query(<<-SQL).to_a
         SELECT flagging_id,
                fid,
                entity_id,
                uid
-          FROM flagging
-         WHERE fid = #{ENV['LIKE_NODE_ID'] || 5}
-            OR fid = #{ENV['LIKE_COMMENT_ID'] || 6}
-         LIMIT #{BATCH_SIZE}
+        FROM flagging
+        WHERE fid = #{LIKE_NODE_ID}
+           OR fid = #{LIKE_COMMENT_ID}
+        LIMIT #{BATCH_SIZE}
         OFFSET #{offset}
       SQL
-      ).to_a
 
-      break if likes.empty?
+      break if rows.empty?
 
-      likes.each do |l|
-        identifier = l['fid'] == (ENV['LIKE_NODE_ID'] || 5) ? 'nid' : 'cid'
-        next unless user_id = user_id_from_imported_user_id(l['uid'])
-        next unless post_id = post_id_from_imported_post_id("#{identifier}:#{l['entity_id']}")
+      rows.each do |row|
+        print_status(count += 1, total_count, get_start_time("likes"))
+
+        identifier = row['fid'] == (LIKE_NODE_ID) ? 'nid' : 'cid'
+        next unless user_id = user_id_from_imported_user_id(row['uid'])
+        next unless post_id = post_id_from_imported_post_id("#{identifier}:#{row['entity_id']}")
         next unless user = User.find_by(id: user_id)
         next unless post = Post.find_by(id: post_id)
-        PostActionCreator.like(user, post) rescue nil
+
+        begin
+          PostActionCreator.like(user, post)
+        rescue StandardError
+          nil
+        end
       end
     end
   end
 
   def import_bookmarks
-    puts "", "importing bookmarks"
+    puts '', 'importing bookmarks'
+
+    total_count = mysql_query(<<~SQL).first['count']
+      SELECT COUNT(uid) count
+      FROM flagging
+      WHERE fid = #{BOOKMARK_ID}
+    SQL
+    count = 0
 
     batches(BATCH_SIZE) do |offset|
-      bookmarks = mysql_query(<<-SQL
-        SELECT flagging_id,
-               fid,
-               entity_id,
-               uid
-          FROM flagging
-         WHERE fid = #{ENV['BOOKMARK_ID'] || 5}
-         LIMIT #{BATCH_SIZE}
-        OFFSET #{offset}
-      SQL
-      ).to_a
-
-      break if bookmarks.empty?
-
-      bookmarks.each do |l|
-        next unless user_id = user_id_from_imported_user_id(l['uid'])
-        next unless post_id = post_id_from_imported_post_id("nid:#{l['entity_id']}")
-        next unless user = User.find_by(id: user_id)
-        next unless post = Post.find_by(id: post_id)
-        PostActionCreator.bookmark(user, post) rescue nil
-      end
-    end
-  end
-
-  def import_watching
-    puts "", "Importing topic subscriptions..."
-
-    batches do |offset|
       rows = mysql_query(<<-SQL
         SELECT flagging_id,
                fid,
                entity_id,
                uid
           FROM flagging
-         WHERE fid = #{ENV['SUBSCRIBE_ID'] || 5}
+         WHERE fid = #{BOOKMARK_ID}
          LIMIT #{BATCH_SIZE}
         OFFSET #{offset}
       SQL
-      ).to_a
+                             ).to_a
+
+      break if rows.empty?
+
+      rows.each do |row|
+        print_status(count += 1, total_count, get_start_time("bookmarks"))
+
+        next unless user_id = user_id_from_imported_user_id(row['uid'])
+        next unless post_id = post_id_from_imported_post_id("nid:#{row['entity_id']}")
+        next unless user = User.find_by(id: user_id)
+        next unless post = Post.find_by(id: post_id)
+
+        begin
+          PostActionCreator.bookmark(user, post)
+        rescue StandardError
+          nil
+        end
+      end
+    end
+  end
+
+  def import_subscriptions
+    puts '', 'importing topic subscriptions...'
+
+    total_count = mysql_query(<<~SQL).first['count']
+      SELECT COUNT(uid) count
+      FROM flagging
+      WHERE fid = #{SUBSCRIBE_ID}
+    SQL
+    count = 0
+
+    batches do |offset|
+      rows = mysql_query(<<-SQL).to_a
+        SELECT flagging_id,
+               fid,
+               entity_id,
+               uid
+        FROM flagging
+        WHERE fid = #{SUBSCRIBE_ID}
+        LIMIT #{BATCH_SIZE}
+        OFFSET #{offset}
+      SQL
 
       break if rows.size < 1
 
       rows.each do |row|
+        print_status(count += 1, total_count, get_start_time("subscriptions"))
+
         user_id = @lookup.user_id_from_imported_user_id(row[:user_id])
         topic = @lookup.topic_lookup_from_imported_post_id(row[:topic_first_post_id])
 
@@ -471,36 +518,31 @@ class ImportScripts::Drupal < ImportScripts::Base
         next unless user = User.find_by(id: user_id)
         next unless post = Post.find_by(id: post_id)
 
-        if user && post
-          TopicUser.change(user.id, post.topic_id, notification_level: NotificationLevels.all[:watching])
-        end
+        TopicUser.change(user.id, post.topic_id, notification_level: NotificationLevels.all[:watching]) if user && post
       end
     end
   end
 
   def mark_topics_as_solved
-    puts "", "marking topics as solved"
+    puts '', 'marking topics as solved'
 
-    solved_topics = TopicCustomField.where(name: "import_solved").where(value: true).pluck(:topic_id)
+    solved_topics = TopicCustomField.where(name: 'import_solved').where(value: true).pluck(:topic_id)
 
     solved_topics.each do |topic_id|
       next unless topic = Topic.find(topic_id)
       next unless post = topic.posts.last
-      post_id = post.id
 
-      PostCustomField.create!(post_id: post_id, name: "is_accepted_answer", value: true)
-      TopicCustomField.create!(topic_id: topic_id, name: "accepted_answer_post_id", value: post_id)
+      PostCustomField.create!(post_id: post.id, name: 'is_accepted_answer', value: true)
+      TopicCustomField.create!(topic_id: topic_id, name: 'accepted_answer_post_id', value: post.id)
     end
   end
 
   def import_sso_records
-    puts "", "importing sso records"
+    puts '', 'importing sso records'
 
     start_time = Time.now
     current_count = 0
-
-    users = UserCustomField.where(name: "import_id")
-
+    users = UserCustomField.where(name: 'import_id')
     total_count = users.count
 
     return if users.empty?
@@ -513,44 +555,45 @@ class ImportScripts::Drupal < ImportScripts::Base
       begin
         current_count += 1
         print_status(current_count, total_count, start_time)
-        SingleSignOnRecord.create!(user_id: user.id, external_id: external_id, external_email: user.email, last_payload: '')
-      rescue
+        SingleSignOnRecord.create!(
+          user_id: user.id,
+          external_id: external_id,
+          external_email: user.email,
+          last_payload: ''
+        )
+      rescue StandardError
         next
       end
     end
   end
 
   def import_attachments
-    puts "", "importing attachments"
+    puts '', 'importing attachments'
 
     current_count = 0
     success_count = 0
     fail_count = 0
 
-    total_count = mysql_query(<<-SQL
-      SELECT count(field_post_attachment_fid) count
-        FROM field_data_field_post_attachment
+    total_count = mysql_query(<<-SQL).first['count']
+      SELECT COUNT(field_post_attachment_fid) count
+      FROM field_data_field_post_attachment
     SQL
-    ).first["count"]
 
     batches(BATCH_SIZE) do |offset|
-      attachments = mysql_query(<<-SQL
-          SELECT *
-            FROM field_data_field_post_attachment fp
-       LEFT JOIN file_managed fm
-              ON fp.field_post_attachment_fid = fm.fid
-           LIMIT #{BATCH_SIZE}
-          OFFSET #{offset}
+      attachments = mysql_query(<<-SQL).to_a
+        SELECT *
+        FROM field_data_field_post_attachment fp
+        LEFT JOIN file_managed fm ON fp.field_post_attachment_fid = fm.fid
+        LIMIT #{BATCH_SIZE}
+        OFFSET #{offset}
       SQL
-      ).to_a
 
       break if attachments.size < 1
 
       attachments.each do |attachment|
-        current_count += 1
-        print_status current_count, total_count
+        print_status(current_count += 1, total_count, get_start_time("attachments"))
 
-        identifier = attachment['entity_type'] == "comment" ? "cid" : "nid"
+        identifier = attachment['entity_type'] == 'comment' ? 'cid' : 'nid'
         next unless user_id = user_id_from_imported_user_id(attachment['uid'])
         next unless post_id = post_id_from_imported_post_id("#{identifier}:#{attachment['entity_id']}")
         next unless user = User.find(user_id)
@@ -569,7 +612,12 @@ class ImportScripts::Drupal < ImportScripts::Base
           new_raw = "#{new_raw}\n\n#{upload_html}" unless new_raw.include?(upload_html)
 
           if new_raw != post.raw
-            PostRevisor.new(post).revise!(post.user, { raw: new_raw }, bypass_bump: true, edit_reason: "Import attachment from Drupal")
+            PostRevisor.new(post).revise!(
+              post.user,
+              { raw: new_raw },
+              bypass_bump: true,
+              edit_reason: 'Import attachment from Drupal'
+            )
           else
             puts '', 'Skipped upload: already imported'
           end
@@ -601,24 +649,24 @@ class ImportScripts::Drupal < ImportScripts::Base
   end
 
   def find_upload(post, attachment)
-    uri = attachment['uri'][/public:\/\/upload\/(.+)/, 1]
+    uri = attachment['uri'][%r{public://upload/(.+)}, 1]
     real_filename = CGI.unescapeHTML(uri)
     file = File.join(ATTACHMENT_DIR, real_filename)
 
-    unless File.exists?(file)
+    unless File.exist?(file)
       puts "Attachment file #{attachment['filename']} doesn't exist"
 
-      tmpfile = "attachments_failed.txt"
+      tmpfile = 'attachments_failed.txt'
       filename = File.join('/tmp/', tmpfile)
-      File.open(filename, 'a') { |f|
+      File.open(filename, 'a') do |f|
         f.puts attachment['filename']
-      }
+      end
     end
 
     upload = create_upload(post.user.id || -1, file, real_filename)
 
     if upload.nil? || upload.errors.any?
-      puts "Upload not valid"
+      puts 'Upload not valid'
       puts upload.errors.inspect if upload
       return
     end
@@ -628,15 +676,17 @@ class ImportScripts::Drupal < ImportScripts::Base
 
   def preprocess_raw(raw)
     return if raw.blank?
+
     # quotes on new lines
-    raw.gsub!(/\[quote\](.+?)\[\/quote\]/im) { |quote|
-      quote.gsub!(/\[quote\](.+?)\[\/quote\]/im) { "\n#{$1}\n" }
-      quote.gsub!(/\n(.+?)/) { "\n> #{$1}" }
-    }
+    raw.gsub!(%r{\[quote\](.+?)\[/quote\]}im) do |quote|
+      quote.gsub!(%r{\[quote\](.+?)\[/quote\]}im) { "\n#{Regexp.last_match(1)}\n" }
+      quote.gsub!(/\n(.+?)/) { "\n> #{Regexp.last_match(1)}" }
+    end
 
     # [QUOTE=<username>]...[/QUOTE]
-    raw.gsub!(/\[quote=([^;\]]+)\](.+?)\[\/quote\]/im) do
-      username, quote = $1, $2
+    raw.gsub!(%r{\[quote=([^;\]]+)\](.+?)\[/quote\]}im) do
+      username = Regexp.last_match(1)
+      quote = Regexp.last_match(2)
       "\n[quote=\"#{username}\"]\n#{quote}\n[/quote]\n"
     end
 
@@ -648,25 +698,29 @@ class ImportScripts::Drupal < ImportScripts::Base
     puts '', 'postprocessing posts'
 
     current = 0
-    max = Post.count
+    total_count = Post.count
 
     Post.find_each do |post|
+      print_status(current += 1, total_count, get_start_time("postprocess_posts"))
+
       begin
         raw = post.raw
         new_raw = raw.dup
 
         # replace old topic to new topic links
-        new_raw.gsub!(/https:\/\/site.com\/forum\/topic\/(\d+)/im) do
-          post_id = post_id_from_imported_post_id("nid:#{$1}")
+        new_raw.gsub!(%r{https://site.com/forum/topic/(\d+)}im) do
+          post_id = post_id_from_imported_post_id("nid:#{Regexp.last_match(1)}")
           next unless post_id
+
           topic = Post.find(post_id).topic
           "https://community.site.com/t/-/#{topic.id}"
         end
 
         # replace old comment to reply links
-        new_raw.gsub!(/https:\/\/site.com\/comment\/(\d+)#comment-\d+/im) do
-          post_id = post_id_from_imported_post_id("cid:#{$1}")
+        new_raw.gsub!(%r{https://site.com/comment/(\d+)#comment-\d+}im) do
+          post_id = post_id_from_imported_post_id("cid:#{Regexp.last_match(1)}")
           next unless post_id
+
           post_ref = Post.find(post_id)
           "https://community.site.com/t/-/#{post_ref.topic_id}/#{post_ref.post_number}"
         end
@@ -675,48 +729,60 @@ class ImportScripts::Drupal < ImportScripts::Base
           post.raw = new_raw
           post.save
         end
-      rescue
+      rescue StandardError
         puts '', "Failed rewrite on post: #{post.id}"
-      ensure
-        print_status(current += 1, max)
       end
     end
   end
 
-  def import_blocked_users
-    puts "", "importing blocked users"
+  def import_muted_users
+    puts '', 'importing muted users'
+
+    total_count = mysql_query(<<~SQL).first['count']
+      SELECT COUNT(*) count
+      FROM pm_block_user
+    SQL
+    count = 0
 
     batches(BATCH_SIZE) do |offset|
-      rows = mysql_query(<<-SQL
+      rows = mysql_query(<<-SQL).to_a
         SELECT author, recipient
-          FROM pm_block_user
-         LIMIT #{BATCH_SIZE}
+        FROM pm_block_user
+        LIMIT #{BATCH_SIZE}
         OFFSET #{offset}
       SQL
-      ).to_a
 
       break if rows.empty?
 
       rows.each do |row|
+        print_status(count += 1, total_count, get_start_time('muted'))
+
         next unless user_id = user_id_from_imported_user_id(row['author'])
         next unless muted_user_id = user_id_from_imported_user_id(row['recipient'])
-        MutedUser.create(user_id: user_id, muted_user_id: muted_user_id) rescue nil
+
+        begin
+          MutedUser.create(user_id: user_id, muted_user_id: muted_user_id)
+        rescue StandardError
+          nil
+        end
       end
     end
   end
 
   def import_gravatars
     puts '', 'importing gravatars'
+
     current = 0
-    max = User.count
+    total_count = User.count
+
     User.find_each do |user|
+      print_status(current += 1, total_count, get_start_time("gravatars"))
+
       begin
         user.create_user_avatar(user_id: user.id) unless user.user_avatar
         user.user_avatar.update_gravatar!
-      rescue
+      rescue StandardError
         puts '', 'Failed avatar update on user #{user.id}'
-      ensure
-        print_status(current += 1, max)
       end
     end
   end
@@ -728,9 +794,6 @@ class ImportScripts::Drupal < ImportScripts::Base
   def mysql_query(sql)
     @client.query(sql, cache_rows: true)
   end
-
 end
 
-if __FILE__ == $0
-  ImportScripts::Drupal.new.perform
-end
+ImportScripts::Drupal.new.perform if __FILE__ == $0
