@@ -29,9 +29,28 @@ class ImportScripts::Drupal < ImportScripts::Base
       # password: 'password',
       database: DRUPAL_DB
     )
+
+    @import_categories = []
+    @topics_to_category = {}
+    @nodes_to_category = {}
+
+    ARGV.each do |arg|
+      key, value = arg.split('=')
+      case key.strip.downcase
+      when 'import_categories'
+        @import_categories = value.split(',').to_set
+      when 'topics_to_category'
+        category_name, topics_list = value.split(',')
+        File.readlines(topics_list).each do |topic|
+          @topics_to_category[topic.strip] = category_name
+        end
+      end
+    end
   end
 
   def execute
+    resolve_url_alias
+
     import_users
     import_muted_users
     import_sso_records
@@ -57,6 +76,25 @@ class ImportScripts::Drupal < ImportScripts::Base
     import_bookmarks
 
     create_permalinks
+  end
+
+  def resolve_url_alias
+    @topics_to_category.each do |topic_url, category|
+      results = mysql_query(<<~SQL).to_a
+        SELECT source
+        FROM url_alias
+        WHERE alias = '#{CGI.unescape(topic_url).gsub('\'', '\\\'')}'
+        LIMIT 1
+      SQL
+
+      if results.empty?
+        next puts "cannot find alias for #{topic_url}"
+      end
+
+      node_id = results.first['source'].gsub('node/', '')
+
+      @nodes_to_category[node_id] = category
+    end
   end
 
   def import_users
@@ -126,6 +164,13 @@ class ImportScripts::Drupal < ImportScripts::Base
         id: category['tid'],
         name: @htmlentities.decode(category['name']).strip,
         description: @htmlentities.decode(category['description']).strip
+      }
+    end
+
+    create_categories(@topics_to_category.values.uniq) do |category_name|
+      {
+        id: category_name,
+        name: category_name
       }
     end
   end
@@ -213,10 +258,18 @@ class ImportScripts::Drupal < ImportScripts::Base
 
       create_posts(results, total: total_count, offset: offset) do |row|
         begin
+          if @nodes_to_category[row['nid'].to_s].present?
+            category_id = @nodes_to_category[row['nid'].to_s]
+          elsif @import_categories.include?(row['tid'].to_s)
+            category_id = row['tid']
+          else
+            next # topic not mapped and category is not imported either
+          end
+
           topic = {
             id: "nid:#{row['nid']}",
             user_id: user_id_from_imported_user_id(row['uid']) || -1,
-            category: category_id_from_imported_category_id(row['tid']),
+            category: category_id_from_imported_category_id(category_id),
             raw: preprocess_raw(row['body']),
             created_at: Time.zone.at(row['created']),
             pinned_at: row['sticky'].to_i == 1 ? Time.zone.at(row['created']) : nil,
