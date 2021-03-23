@@ -571,7 +571,10 @@ class ImportScripts::Drupal < ImportScripts::Base
         next unless user = User.find_by(id: user_id)
         next unless post = Post.find_by(id: post_id)
 
-        TopicUser.change(user.id, post.topic_id, notification_level: NotificationLevels.all[:watching]) if user && post
+        if user && post
+          PostActionCreator.bookmark(user, post)
+          TopicUser.change(user.id, post.topic_id, notification_level: NotificationLevels.all[:watching])
+        end
       end
     end
   end
@@ -810,8 +813,8 @@ class ImportScripts::Drupal < ImportScripts::Base
       rows.each do |row|
         print_status(count += 1, total_count, get_start_time('muted'))
 
-        next unless user_id = user_id_from_imported_user_id(row['author'])
-        next unless muted_user_id = user_id_from_imported_user_id(row['recipient'])
+        next unless user_id = user_id_from_imported_user_id(row['recipient'])
+        next unless muted_user_id = user_id_from_imported_user_id(row['author'])
 
         begin
           MutedUser.create(user_id: user_id, muted_user_id: muted_user_id)
