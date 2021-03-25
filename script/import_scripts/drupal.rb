@@ -464,7 +464,7 @@ class ImportScripts::Drupal < ImportScripts::Base
     batches(BATCH_SIZE) do |offset|
       rows = mysql_query(<<-SQL).to_a
         SELECT flagging_id,
-               fid,
+               entity_type,
                entity_id,
                uid
         FROM flagging
@@ -479,7 +479,7 @@ class ImportScripts::Drupal < ImportScripts::Base
       rows.each do |row|
         print_status(count += 1, total_count, get_start_time("likes"))
 
-        identifier = row['fid'] == (LIKE_NODE_ID) ? 'nid' : 'cid'
+        identifier = row['entity_type'] == 'comment' ? 'cid' : 'nid'
         next unless user_id = user_id_from_imported_user_id(row['uid'])
         next unless post_id = post_id_from_imported_post_id("#{identifier}:#{row['entity_id']}")
         next unless user = User.find_by(id: user_id)
