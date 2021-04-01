@@ -488,7 +488,7 @@ class ImportScripts::Drupal < ImportScripts::Base
         begin
           PostActionCreator.like(user, post)
         rescue StandardError
-          nil
+          puts "cannot import like (user = #{row['uid']} / #{user_id}, post_id = #{identifier}:#{row['entity_id']} / #{post_id})"
         end
       end
     end
@@ -505,9 +505,9 @@ class ImportScripts::Drupal < ImportScripts::Base
     count = 0
 
     batches(BATCH_SIZE) do |offset|
-      rows = mysql_query(<<-SQL
+      rows = mysql_query(<<-SQL).to_a
         SELECT flagging_id,
-               fid,
+               entity_type,
                entity_id,
                uid
           FROM flagging
@@ -515,22 +515,22 @@ class ImportScripts::Drupal < ImportScripts::Base
          LIMIT #{BATCH_SIZE}
         OFFSET #{offset}
       SQL
-                             ).to_a
 
       break if rows.empty?
 
       rows.each do |row|
         print_status(count += 1, total_count, get_start_time("bookmarks"))
 
+        identifier = row['entity_type'] == 'comment' ? 'cid' : 'nid'
         next unless user_id = user_id_from_imported_user_id(row['uid'])
-        next unless post_id = post_id_from_imported_post_id("nid:#{row['entity_id']}")
+        next unless post_id = post_id_from_imported_post_id("#{identifier}:#{row['entity_id']}")
         next unless user = User.find_by(id: user_id)
         next unless post = Post.find_by(id: post_id)
 
         begin
-          PostActionCreator.bookmark(user, post)
+          BookmarkManager.new(user).create(post_id: post.id)
         rescue StandardError
-          nil
+          puts "cannot import bookmark (user = #{row['uid']} / #{user_id}, post_id = #{identifier}:#{row['entity_id']} / #{post_id})"
         end
       end
     end
@@ -546,10 +546,10 @@ class ImportScripts::Drupal < ImportScripts::Base
     SQL
     count = 0
 
-    batches do |offset|
+    batches(BATCH_SIZE) do |offset|
       rows = mysql_query(<<-SQL).to_a
         SELECT flagging_id,
-               fid,
+               entity_type,
                entity_id,
                uid
         FROM flagging
@@ -558,22 +558,27 @@ class ImportScripts::Drupal < ImportScripts::Base
         OFFSET #{offset}
       SQL
 
-      break if rows.size < 1
+      break if rows.empty?
 
       rows.each do |row|
         print_status(count += 1, total_count, get_start_time("subscriptions"))
 
-        user_id = @lookup.user_id_from_imported_user_id(row[:user_id])
-        topic = @lookup.topic_lookup_from_imported_post_id(row[:topic_first_post_id])
-
+        identifier = row['entity_type'] == 'comment' ? 'cid' : 'nid'
         next unless user_id = user_id_from_imported_user_id(row['uid'])
-        next unless post_id = post_id_from_imported_post_id("nid:#{row['entity_id']}")
+        next unless post_id = post_id_from_imported_post_id("#{identifier}:#{row['entity_id']}")
         next unless user = User.find_by(id: user_id)
         next unless post = Post.find_by(id: post_id)
 
-        if user && post
-          PostActionCreator.bookmark(user, post)
+        begin
           TopicUser.change(user.id, post.topic_id, notification_level: NotificationLevels.all[:watching])
+        rescue StandardError
+          puts "cannot import subscription (user = #{row['uid']} / #{user_id}, post_id = #{identifier}:#{row['entity_id']} / #{post_id})"
+        end
+
+        begin
+          BookmarkManager.new(user).create(post_id: post.id)
+        rescue StandardError
+          puts "cannot import subscription as bookmark (user = #{row['uid']} / #{user_id}, post_id = #{identifier}:#{row['entity_id']} / #{post_id})"
         end
       end
     end
