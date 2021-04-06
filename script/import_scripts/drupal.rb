@@ -30,6 +30,8 @@ class ImportScripts::Drupal < ImportScripts::Base
       database: DRUPAL_DB
     )
 
+    @last_invalid_user_id = 0
+
     @import_categories = []
     @topics_to_category = {}
     @nodes_to_category = {}
@@ -127,8 +129,11 @@ class ImportScripts::Drupal < ImportScripts::Base
       create_users(users, total: total_count, offset: offset) do |user|
         username = @htmlentities.decode(user['username']).strip
 
-        email = user['email'].presence || fake_email
-        email = fake_email unless email[EmailValidator.email_regex]
+        email = user['email'].presence || ''
+        unless email[EmailValidator.email_regex]
+          @last_invalid_user_id = @last_invalid_user_id + 1
+          email = "invalid_user_#{@last_invalid_user_id}@email.invalid"
+        end
 
         {
           id: user['uid'],
