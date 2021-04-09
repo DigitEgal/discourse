@@ -132,7 +132,8 @@ class ImportScripts::Drupal < ImportScripts::Base
         email = user['email'].presence || ''
         unless email[EmailValidator.email_regex]
           @last_invalid_user_id = @last_invalid_user_id + 1
-          email = "invalid_user_#{@last_invalid_user_id}@email.invalid"
+          email = @last_invalid_user_id > 1 ? "invalid_user_#{@last_invalid_user_id}@email.invalid"
+                                            : "invalid_user@email.invalid"
         end
 
         {
@@ -705,11 +706,53 @@ class ImportScripts::Drupal < ImportScripts::Base
         if tcf && tcf['import_id']
           node_id = tcf['import_id'][/nid:(\d+)/, 1]
           slug = "/topic/#{node_id}"
-          Permalink.create(url: slug, topic_id: topic.id)
+          Permalink.find_or_create_by!(url: slug, topic_id: topic.id)
         end
       rescue => e
         puts e.message
         puts "Permalink creation failed for id #{topic.id}"
+      end
+    end
+
+    puts '', 'creating permalinks from url_alias...'
+
+    current_count = 0
+    total_count = mysql_query(<<-SQL).first['count']
+      SELECT COUNT(*) count
+      FROM url_alias
+    SQL
+
+    batches(BATCH_SIZE) do |offset|
+      aliases = mysql_query(<<-SQL).to_a
+        SELECT source, alias
+        FROM url_alias
+        LIMIT #{BATCH_SIZE}
+        OFFSET #{offset}
+      SQL
+
+      break if aliases.size < 1
+
+      aliases.each do |row|
+        print_status(current_count += 1, total_count, get_start_time("aliases"))
+
+        entity_type, entity_id = row['source'].split('/')
+
+        begin
+          if entity_type == 'forum'
+            category_id = category_id_from_imported_category_id(entity_id)
+            Permalink.find_or_create_by!(url: row['alias'], category_id: category_id)
+          elsif entity_type == 'node'
+            topic_mapping = topic_lookup_from_imported_post_id("nid:#{entity_id}")
+            if topic_mapping && topic_id = topic_mapping[:topic_id]
+              Permalink.find_or_create_by!(url: row['alias'], topic_id: topic_id)
+            end
+          elsif entity_type == 'user'
+            username = @lookup.find_username_by_import_id(entity_id)
+            Permalink.find_or_create_by!(url: row['alias'], external_url: "/u/#{username}") if username.present?
+          end
+        rescue => e
+          puts e
+        end
       end
     end
   end
