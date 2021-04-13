@@ -56,7 +56,7 @@ class ImportScripts::Drupal < ImportScripts::Base
     import_users
     import_muted_users
     import_sso_records
-    import_gravatars
+    import_gravatars if ENV['DRUPAL_IMPORT_GRAVATAR']
 
     import_categories
 
