@@ -58,21 +58,19 @@ class ImportScripts::Drupal < ImportScripts::Base
     import_sso_records
     import_gravatars if ENV['DRUPAL_IMPORT_GRAVATAR']
 
-    import_categories
+    import_categories if !ENV['DRUPAL_SKIP_CATEGORIES']
 
     # "Nodes" in Drupal are divided into types. Here we import two types,
     # and will later import all the comments/replies for each node.
     # You will need to figure out what the type names are on your install and edit the queries to match.
     import_blog_topics if ENV['DRUPAL_IMPORT_BLOG']
 
-    import_forum_topics
-    import_replies
+    import_topics
+    import_posts
     import_private_messages
-
     import_attachments
     mark_topics_as_solved
-    postprocess_posts
-
+    postprocess_posts if ENV['DRUPAL_POSTPROCESS_POSTS']
     import_subscriptions
     import_likes
     import_bookmarks
@@ -224,7 +222,7 @@ class ImportScripts::Drupal < ImportScripts::Base
     end
   end
 
-  def import_forum_topics
+  def import_topics
     puts '', 'importing forum topics'
 
     total_count = mysql_query(<<-SQL).first['count']
@@ -294,7 +292,7 @@ class ImportScripts::Drupal < ImportScripts::Base
     end
   end
 
-  def import_replies
+  def import_posts
     puts '', 'creating replies in topics'
 
     total_count = mysql_query(<<-SQL).first['count']
